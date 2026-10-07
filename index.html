@@ -1,0 +1,1105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#0e7490">
+<title>SeaPeople — idle island economy</title>
+<!--
+  SeaPeople: a single-file mobile-first idle/tapper game.
+  Core loop: boats arrive -> adepts disembark & run inland -> town reproduces -> GDP grows
+             -> spend GDP on upgrades -> (optional) prestige for permanent multipliers.
+
+  Structure of this file:
+    [CSS]   layout, HUD, bottom-sheet panels, buttons
+    [JS-1]  utils + big number formatting
+    [JS-2]  data definitions (upgrades / research / milestones / achievements)
+    [JS-3]  game state, save/load, offline progress
+    [JS-4]  simulation tick (income, reproduction, boats, auto-summon)
+    [JS-5]  rendering (canvas scene + DOM HUD/panels)
+    [JS-6]  input handling, tabs, prestige/settings actions, boot
+-->
+<style>
+  /* ---------- Base / mobile-first layout ---------- */
+  * { margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  html, body { height:100%; overflow:hidden; overscroll-behavior:none; touch-action:manipulation; }
+  body {
+    font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background:#0b3a4a; color:#eafcff;
+    user-select:none; -webkit-user-select:none;
+  }
+  #app { position:fixed; inset:0; max-width:520px; margin:0 auto; }
+  canvas#scene { position:absolute; inset:0; width:100%; height:100%; display:block; touch-action:none; cursor:pointer; }
+
+  /* ---------- HUD (top) ---------- */
+  #hud {
+    position:absolute; top:0; left:0; right:0;
+    padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+    display:flex; flex-direction:column; gap:6px; pointer-events:none; z-index:5;
+  }
+  .hud-row { display:flex; gap:8px; align-items:stretch; }
+  .stat-card {
+    flex:1; background:rgba(4,30,40,.72); border:1px solid rgba(120,220,255,.25);
+    border-radius:14px; padding:6px 10px; backdrop-filter: blur(4px);
+  }
+  .stat-card .label { font-size:10px; letter-spacing:.08em; text-transform:uppercase; opacity:.75; }
+  .stat-card .value { font-size:clamp(16px,5.2vw,22px); font-weight:800; line-height:1.15;
+                      font-variant-numeric: tabular-nums; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;}
+  .stat-card .sub   { font-size:11px; opacity:.8; }
+  #tierCard .value  { font-size:clamp(13px,4vw,17px); }
+  .gold  { color:#ffd76a; }
+  .teal  { color:#7ff5d0; }
+
+  /* Legacy chip (only visible after first prestige) */
+  #legacyChip { align-self:flex-end; pointer-events:auto; cursor:pointer;
+    background:rgba(80,40,120,.75); border:1px solid #c99aff; color:#f2e2ff;
+    border-radius:999px; padding:4px 12px; font-size:12px; font-weight:700; }
+
+  /* Energy bar under HUD */
+  #energyWrap { pointer-events:none; margin-top:2px; }
+  #energyBar { height:8px; border-radius:999px; background:rgba(4,30,40,.6);
+               border:1px solid rgba(120,220,255,.3); overflow:hidden; }
+  #energyFill { height:100%; width:100%; background:linear-gradient(90deg,#38e8c8,#8ef06a); transition:width .1s linear; }
+  #energyHint { font-size:10px; opacity:.7; text-align:center; margin-top:2px; }
+
+  /* Toast messages */
+  #toast {
+    position:absolute; left:50%; transform:translateX(-50%);
+    top: calc(env(safe-area-inset-top) + 150px);
+    background:rgba(4,30,40,.9); border:1px solid rgba(120,220,255,.4);
+    padding:8px 16px; border-radius:12px; font-size:13px; font-weight:600;
+    opacity:0; transition:opacity .3s; pointer-events:none; z-index:20; max-width:86%;
+    text-align:center;
+  }
+
+  /* ---------- Bottom nav ---------- */
+  #navbar {
+    position:absolute; left:0; right:0; bottom:0; z-index:8;
+    display:flex; gap:6px; padding:8px 8px calc(8px + env(safe-area-inset-bottom));
+    background:linear-gradient(to top, rgba(3,20,28,.95), rgba(3,20,28,.6) 70%, transparent);
+  }
+  #navbar button {
+    flex:1; min-height:52px; border-radius:14px; border:1px solid rgba(120,220,255,.3);
+    background:rgba(6,40,54,.85); color:#dff6ff; font-size:13px; font-weight:700;
+    display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px;
+    cursor:pointer;
+  }
+  #navbar button .ico { font-size:18px; }
+  #navbar button.active { background:#0e7490; border-color:#7ff5d0; }
+  #navbar button .dot { position:absolute; }
+
+  /* ---------- Bottom sheet panel ---------- */
+  #panel {
+    position:absolute; left:0; right:0; bottom:68px;   /* sits above the navbar so nav tabs stay tappable */
+    height:min(62vh, 540px);
+    background:rgba(4,26,36,.97); border-top-left-radius:22px; border-top-right-radius:22px;
+    border-top:1px solid rgba(120,220,255,.35);
+    transform:translateY(102%); transition:transform .25s ease;
+    display:flex; flex-direction:column;
+    z-index:9;
+  }
+  #panel.open { transform:translateY(0); }
+  #panelHeader { display:flex; align-items:center; justify-content:space-between; padding:12px 16px 6px; }
+  #panelTitle { font-size:17px; font-weight:800; }
+  #panelClose { width:36px; height:36px; border-radius:50%; border:none; background:rgba(255,255,255,.12);
+                color:#fff; font-size:18px; cursor:pointer; }
+  /* panel sits above the navbar, so only a small inner padding is needed */
+  #panelBody { overflow-y:auto; -webkit-overflow-scrolling:touch; padding:6px 12px 12px; flex:1; }
+
+  .group-label { font-size:11px; text-transform:uppercase; letter-spacing:.1em; opacity:.6; margin:12px 4px 6px; }
+
+  /* Upgrade / research rows */
+  .row-btn {
+    width:100%; display:flex; align-items:center; gap:10px; text-align:left;
+    background:rgba(14,60,80,.7); border:1px solid rgba(120,220,255,.22); border-radius:14px;
+    padding:10px 12px; margin-bottom:8px; color:#eafcff; cursor:pointer;
+  }
+  .row-btn:disabled { opacity:.45; cursor:default; }
+  .row-btn.locked { opacity:.55; }
+  .row-btn .r-ico { font-size:24px; width:34px; text-align:center; flex:none; }
+  .row-btn .r-main { flex:1; min-width:0; }
+  .row-btn .r-name { font-weight:800; font-size:14px; }
+  .row-btn .r-desc { font-size:11px; opacity:.75; margin-top:1px; }
+  .row-btn .r-eff  { font-size:11px; color:#7ff5d0; margin-top:2px; }
+  .row-btn .r-cost { text-align:right; flex:none; }
+  .row-btn .r-price { font-weight:800; font-size:13px; color:#ffd76a; white-space:nowrap; }
+  .row-btn .r-lvl   { font-size:11px; opacity:.7; }
+  .row-btn.affordable { border-color:#ffd76a; background:rgba(30,80,60,.75); }
+  .row-btn.bought { border-color:#c99aff; background:rgba(60,30,90,.6); }
+
+  /* Buy-mode toggle */
+  #buyModeRow { display:flex; gap:6px; margin-bottom:10px; }
+  #buyModeRow button { flex:1; padding:8px 0; border-radius:10px; border:1px solid rgba(120,220,255,.3);
+    background:rgba(6,40,54,.8); color:#dff6ff; font-weight:700; font-size:12px; cursor:pointer; }
+  #buyModeRow button.active { background:#0e7490; border-color:#7ff5d0; }
+
+  /* Prestige / settings blocks */
+  .big-btn {
+    width:100%; min-height:56px; border-radius:16px; border:none; font-size:16px; font-weight:800;
+    cursor:pointer; margin:8px 0; color:#fff;
+  }
+  .big-btn.prestige { background:linear-gradient(135deg,#7c3aed,#a855f7); box-shadow:0 4px 18px rgba(168,85,247,.4); }
+  .big-btn.prestige:disabled { background:#3a3a4a; opacity:.6; cursor:default; box-shadow:none; }
+  .big-btn.danger { background:#7f1d1d; }
+  .info-box { background:rgba(14,60,80,.6); border:1px solid rgba(120,220,255,.25); border-radius:14px;
+              padding:12px; font-size:13px; line-height:1.5; margin-bottom:10px; }
+  .kv { display:flex; justify-content:space-between; }
+  .achv { display:flex; gap:8px; align-items:center; font-size:12px; padding:6px 4px; opacity:.45; }
+  .achv.done { opacity:1; }
+  .achv .a-ico { font-size:18px; }
+  .goal-line { font-size:13px; padding:6px 4px; }
+  .goal-line.done { color:#7ff5d0; }
+  .bar { height:8px; background:rgba(255,255,255,.12); border-radius:999px; overflow:hidden; margin-top:4px;}
+  .bar > div { height:100%; background:linear-gradient(90deg,#38e8c8,#8ef06a); }
+</style>
+</head>
+<body>
+<div id="app">
+  <canvas id="scene"></canvas>
+
+  <!-- ===== HUD ===== -->
+  <div id="hud">
+    <div class="hud-row">
+      <div class="stat-card" style="flex:1.4">
+        <div class="label">GDP</div>
+        <div class="value gold" id="gdpVal">0</div>
+        <div class="sub teal"><span id="gpsVal">0</span>/sec &nbsp;·&nbsp; <span id="popVal">0</span>/<span id="capVal">0</span> adepts</div>
+      </div>
+      <div class="stat-card" id="tierCard">
+        <div class="label">Settlement</div>
+        <div class="value" id="tierVal">Raft Camp</div>
+        <div class="sub" id="nextTierVal">Next: Village</div>
+      </div>
+    </div>
+    <div id="energyWrap">
+      <div id="energyBar"><div id="energyFill"></div></div>
+      <div id="energyHint">Tap the sea to summon boats!</div>
+    </div>
+  </div>
+  <button id="legacyChip" hidden>✦ 0 Founders · ×1.00</button>
+  <div id="toast"></div>
+
+  <!-- ===== Bottom sheet panel ===== -->
+  <div id="panel">
+    <div id="panelHeader">
+      <div id="panelTitle">Upgrades</div>
+      <button id="panelClose">✕</button>
+    </div>
+    <div id="panelBody"></div>
+  </div>
+
+  <!-- ===== Bottom navigation ===== -->
+  <nav id="navbar">
+    <button data-tab="upgrades" class="active"><span class="ico">🛠️</span>Upgrades</button>
+    <button data-tab="research"><span class="ico">🔬</span>Research</button>
+    <button data-tab="prestige"><span class="ico">✦</span>Prestige</button>
+    <button data-tab="settings"><span class="ico">⚙️</span>Settings</button>
+  </nav>
+</div>
+
+<script>
+"use strict";
+/* =====================================================================
+   [JS-1] UTILITIES & BIG-NUMBER FORMATTING
+   ===================================================================== */
+const $ = id => document.getElementById(id);
+const clamp = (v,a,b)=>Math.min(b,Math.max(a,v));
+
+// Number formatting: K, M, B, T, Qa, Qi, ... then scientific notation.
+const SUFF = ["","K","M","B","T","Qa","Qi","Sx","Sp","Oc","No","Dc"];
+function fmt(n, dec){
+  if (!isFinite(n)) return "∞";
+  if (n < 0) return "-" + fmt(-n, dec);
+  if (n < 1000) return (n < 10 && n % 1 !== 0 ? n.toFixed(dec ?? 1) : Math.floor(n).toString());
+  const tier = Math.floor(Math.log10(n)/3);
+  if (tier < SUFF.length){
+    const s = n / Math.pow(10, tier*3);
+    return s.toFixed(s < 10 ? 2 : (s < 100 ? 1 : 0)) + SUFF[tier];
+  }
+  return n.toExponential(2).replace("+","");
+}
+function fmtTime(sec){
+  sec = Math.floor(sec);
+  const h = Math.floor(sec/3600), m = Math.floor(sec%3600/60), s = sec%60;
+  if (h) return h+"h "+m+"m"; if (m) return m+"m "+s+"s"; return s+"s";
+}
+let toastTimer = null;
+function toast(msg){
+  const t = $("toast"); t.textContent = msg; t.style.opacity = 1;
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(()=>{ t.style.opacity = 0; }, 2600);
+}
+function vibrate(ms){ if (navigator.vibrate) { try{ navigator.vibrate(ms); }catch(e){} } }
+
+/* =====================================================================
+   [JS-2] DATA DEFINITIONS
+   All balance numbers live here so features can be tweaked easily.
+   ===================================================================== */
+
+// ---- Run-local upgrades (reset on prestige) --------------------------
+// effect(u) returns a human string describing what the next level does.
+const UPGRADES = [
+  // -- Boats --
+  { id:"boatSpeed", group:"Boats", icon:"⛵", name:"Sail Polish",
+    desc:"Boats sail faster to shore.",
+    baseCost:15, costMult:1.55, maxLvl:Infinity,
+    stat:u=>1+0.10*u },                       // boat travel speed multiplier
+  { id:"boatCap", group:"Boats", icon:"🛶", name:"Bigger Inflatable",
+    desc:"+1 adept per arriving boat.",
+    baseCost:60, costMult:4.2, maxLvl:25,     // steep cost keeps crew size a rare, milestone-like purchase
+    stat:u=>1+u },                            // added to crew size
+  { id:"boatFreq", group:"Boats", icon:"🌊", name:"Tide Charts",
+    desc:"Boats arrive more often (-4% interval, diminishing).",
+    baseCost:120, costMult:1.9, maxLvl:30,
+    stat:u=>Math.pow(0.96,u) },               // multiplied into arrival interval
+  // -- Housing --
+  { id:"housing", group:"Housing", icon:"🏠", name:"Palm Cottages",
+    desc:"+1 population cap.",
+    baseCost:25, costMult:1.32, maxLvl:Infinity,
+    stat:u=>u },                              // flat cap bonus
+  { id:"districts", group:"Housing", icon:"🏘️", name:"New Districts",
+    desc:"+25% housing capacity.",
+    unlocked:s=>s.up.housing>=15,
+    baseCost:2500, costMult:2.1, maxLvl:12,
+    stat:u=>1+0.25*u },
+  // -- Productivity --
+  { id:"gdpAdept", group:"Productivity", icon:"⚒️", name:"Work Ethic",
+    desc:"+15% GDP per adept.",
+    baseCost:40, costMult:1.6, maxLvl:Infinity,
+    stat:u=>Math.pow(1.15,u) },
+  { id:"efficiency", group:"Productivity", icon:"📈", name:"Efficiency Experts",
+    desc:"+20% global GDP.",
+    unlocked:s=>s.up.gdpAdept>=8,
+    baseCost:5000, costMult:2.0, maxLvl:15,
+    stat:u=>1+0.20*u },
+  // -- Fertility --
+  { id:"fertility", group:"Fertility", icon:"🍼", name:"Baby Bonuses",
+    desc:"+25% adept reproduction rate.",
+    baseCost:200, costMult:1.8, maxLvl:Infinity,
+    stat:u=>1+0.25*u },
+  // -- Automation --
+  { id:"autoSummon", group:"Automation", icon:"🤖", name:"Harbor Master",
+    desc:"Auto-taps the sea every 5s when energy is full.",
+    unlocked:s=>s.totalClicks>=200 || s.runTime>900,
+    baseCost:1000, costMult:2.5, maxLvl:1,
+    stat:u=>u },
+  { id:"autoBuy", group:"Automation", icon:"🛒", name:"Shopping Intern",
+    desc:"Automatically buys affordable upgrades (cheapest first).",
+    unlocked:s=>s.research.includes("automation"),
+    baseCost:100000, costMult:1, maxLvl:1,
+    stat:u=>u },
+];
+
+// ---- Research (permanent per-run; reset on prestige) -----------------
+const RESEARCH = [
+  { id:"tallerBoats", icon:"⚓", name:"Keels & Motors", cost:5000,
+    desc:"Boat capacity and speed upgrades are 25% cheaper." },
+  { id:"urbanPlan", icon:"🗺️", name:"Urban Planning", cost:25000,
+    desc:"Housing upgrade costs scale 10% slower." },
+  { id:"marketing", icon:"📣", name:"Tourism Marketing", cost:120000,
+    desc:"All GDP gains +50%." },
+  { id:"biotech", icon:"🧬", name:"Repro Biotech", cost:600000,
+    desc:"Reproduction rate doubled." },
+  { id:"logistics", icon:"🚚", name:"Logistics Network", cost:3e6,
+    desc:"Boat arrival interval reduced by 20%." },
+  { id:"automation", icon:"🤖", name:"Automation R&D", cost:1.5e7,
+    desc:"Unlocks the Shopping Intern upgrade." },
+];
+
+// ---- Settlement tiers (milestones by total GDP earned this run) ------
+const TIERS = [
+  { gdp:0,       name:"Raft Camp",     buildings:2, palette:["straw"] },
+  { gdp:2e3,     name:"Village",       buildings:4, palette:["straw","wood"] },
+  { gdp:1e5,     name:"Town",          buildings:7, palette:["wood","brick"] },
+  { gdp:5e6,     name:"City",          buildings:10, palette:["brick","concrete"] },
+  { gdp:5e8,     name:"Metropolis",    buildings:14, palette:["concrete","glass"] },
+  { gdp:1e11,    name:"Nation",        buildings:18, palette:["glass","tower"] },
+];
+
+// ---- Achievements -----------------------------------------------------
+const ACHIEVEMENTS = [
+  { id:"firstBoat", icon:"🛶", name:"First Contact",   test:s=>s.stats.boatsArrived>=1 },
+  { id:"pop10",     icon:"👪", name:"Housefull",       test:s=>s.stats.maxPop>=10 },
+  { id:"pop100",    icon:"🏙️", name:"Crowded Shore",   test:s=>s.stats.maxPop>=100 },
+  { id:"tap500",    icon:"👆", name:"Five Hundred Fingers", test:s=>s.totalClicks>=500 },
+  { id:"gdp1m",     icon:"💰", name:"Millionaire Tide", test:s=>s.totalGdpRun>=1e6 },
+  { id:"town",      icon:"🏘️", name:"Zoning Approved",  test:s=>s.tierIndex>=2 },
+  { id:"prestige1", icon:"✦",  name:"Founder",          test:s=>s.prestiges>=1 },
+  { id:"founder10", icon:"👑", name:"Ten Founders",     test:s=>s.founders>=10 },
+];
+
+// ---- Balance constants -------------------------------------------------
+const BAL = {
+  OFFLINE_CAP_HOURS: 8,       // offline earnings capped at 8 hours
+  SAVE_KEY: "seapeople.save.v1",
+  SAVE_INTERVAL: 10,          // autosave every N seconds
+  BASE_BOAT_INTERVAL: 6,      // seconds between passive boat arrivals
+  BASE_CREW: 1,               // adepts per boat before upgrades
+  BOAT_ENERGY_MAX: 100,
+  BOAT_ENERGY_REGEN: 2,       // per second
+  BOAT_TAP_COST: 20,          // energy per tap
+  REPRO_BASE: 0.02,           // base births per adept per second (before modifiers)
+  POP_GROWTH_SOFTCAP: 0.15,   // fraction of cap where reproduction starts slowing
+  BOAT_REPRO_SHARE: 0.35,     // share of reproduction rate that passive boats add directly
+  BASE_GDP_PER_ADEPT: 1,
+  PRESTIGE_REQ: 1e6,          // total GDP this run required to prestige
+};
+
+/* =====================================================================
+   [JS-3] GAME STATE, SAVE / LOAD, OFFLINE PROGRESS
+   ===================================================================== */
+function defaultState(){
+  return {
+    v: 1,
+    gdp: 0,
+    pop: 0,
+    up: Object.fromEntries(UPGRADES.map(u=>[u.id,0])),
+    research: [],                 // ids of bought research (per run)
+    founders: 0,                  // prestige currency (permanent)
+    prestiges: 0,
+    achv: [],                     // unlocked achievement ids
+    // counters / stats
+    totalGdpRun: 0,               // total GDP earned this run (drives tiers & prestige gain)
+    totalGdpAll: 0,
+    totalClicks: 0,
+    runTime: 0,
+    stats: { boatsArrived:0, maxPop:0 },
+    daily: { date:"", gdpEarned:0, done:false },
+    settings: { sound:true, hint:true },
+    lastSave: Date.now(),
+    // runtime-only (not saved): energy
+    energy: BAL.BOAT_ENERGY_MAX,
+    playTime: 0,
+  };
+}
+let S = defaultState();
+
+// Derived getters -------------------------------------------------------
+function upStat(id){ const d = UPGRADES.find(u=>u.id===id); return d.stat(S.up[id]); }
+function discount(group){
+  // Research: boat upgrades cheaper
+  if (S.research.includes("tallerBoats") && group==="Boats") return 0.75;
+  return 1;
+}
+function costMultFor(def){
+  if (S.research.includes("urbanPlan") && def.group==="Housing" && def.costMult>1)
+    return def.costMult - 0.10;
+  return def.costMult;
+}
+function upCost(def){
+  const lvl = S.up[def.id];
+  return Math.ceil(def.baseCost * discount(def.group) * Math.pow(costMultFor(def), lvl));
+}
+function popCap(){
+  const f = 1 + 0.02*S.founders;               // founder bonus also helps housing
+  return Math.floor((10 + upStat("housing")) * upStat("districts") * f);
+}
+function boatInterval(){
+  let t = BAL.BASE_BOAT_INTERVAL * upStat("boatFreq");
+  if (S.research.includes("logistics")) t *= 0.8;
+  t /= 1 + 0.01*S.founders;                    // small permanent boat speed bonus
+  return Math.max(0.5, t);
+}
+function crewSize(){
+  const f = 1 + 0.02*S.founders;
+  return Math.max(1, Math.round((BAL.BASE_CREW + upStat("boatCap")) * f));
+}
+function gdpPerSec(){
+  const f = 1 + 0.10*S.founders;               // legacy multiplier: +10% GDP per Founder
+  let m = f * upStat("gdpAdept") * upStat("efficiency");
+  if (S.research.includes("marketing")) m *= 1.5;
+  return S.pop * BAL.BASE_GDP_PER_ADEPT * m;
+}
+function reproRate(){                             // expected births/sec (soft-capped)
+  if (S.pop <= 0) return 0;
+  let r = BAL.REPRO_BASE * upStat("fertility");
+  if (S.research.includes("biotech")) r *= 2;
+  r *= 1 + 0.01*S.founders;
+  const cap = popCap();
+  const frac = S.pop / cap;
+  if (frac >= 1) return 0;
+  if (frac > 1 - BAL.POP_GROWTH_SOFTCAP)
+    r *= Math.max(0, (1 - frac) / BAL.POP_GROWTH_SOFTCAP);   // slow near cap
+  return r * S.pop;
+}
+function prestigeGain(){
+  if (S.totalGdpRun < BAL.PRESTIGE_REQ) return 0;
+  return Math.floor(Math.sqrt(S.totalGdpRun / BAL.PRESTIGE_REQ));
+}
+function tierIndexFor(gdpTotal){
+  let i = 0;
+  for (let k=0;k<TIERS.length;k++) if (gdpTotal >= TIERS[k].gdp) i = k;
+  return i;
+}
+
+// Save / load -----------------------------------------------------------
+function save(){
+  S.lastSave = Date.now();
+  try { localStorage.setItem(BAL.SAVE_KEY, JSON.stringify(S)); } catch(e){}
+}
+function load(){
+  let raw = null;
+  try { raw = localStorage.getItem(BAL.SAVE_KEY); } catch(e){}
+  if (!raw) return false;
+  try {
+    const d = JSON.parse(raw);
+    S = Object.assign(defaultState(), d);
+    S.up = Object.assign(Object.fromEntries(UPGRADES.map(u=>[u.id,0])), d.up||{});
+    S.settings = Object.assign({sound:true,hint:true}, d.settings||{});
+    S.stats = Object.assign({boatsArrived:0,maxPop:0}, d.stats||{});
+    S.energy = d.energy ?? BAL.BOAT_ENERGY_MAX;
+    return true;
+  } catch(e){ return false; }
+}
+
+// Offline progress: fast-forward the economy (no animation) -------------
+function applyOffline(){
+  const elapsed = clamp((Date.now() - S.lastSave)/1000, 0, BAL.OFFLINE_CAP_HOURS*3600);
+  if (elapsed < 30) return;                 // ignore tiny gaps
+  const dt = Math.floor(elapsed);
+  const cap = popCap();
+  // step in coarse chunks so the reproduction curve is approximated
+  const steps = Math.min(240, Math.max(1, Math.ceil(dt/60)));
+  const sub = dt/steps;
+  let earned = 0, arrived = 0;
+  for (let i=0;i<steps;i++){
+    earned += gdpPerSec()*sub;
+    // population: births + boat-arrival share (same model as live tick)
+    S.pop = Math.min(cap, S.pop + reproRate()*sub*(1 + BAL.BOAT_REPRO_SHARE));
+    arrived += sub / boatInterval();
+  }
+  // boats that would have physically docked while away land their crews too
+  S.pop = Math.min(cap, S.pop + Math.floor(arrived)*crewSize());
+  S.gdp += earned; S.totalGdpRun += earned; S.totalGdpAll += earned;
+  S.daily.gdpEarned += earned;
+  S.stats.boatsArrived += Math.floor(arrived);
+  S.stats.maxPop = Math.max(S.stats.maxPop, Math.floor(S.pop));
+  S.runTime += dt;
+  if (earned > 0){
+    showWelcome(earned, dt);
+  }
+}
+function showWelcome(earned, dt){
+  toast("Welcome back! +" + fmt(earned) + " GDP over " + fmtTime(dt) + " away");
+}
+
+/* =====================================================================
+   [JS-4] SIMULATION TICK
+   ===================================================================== */
+let boatTimer = 0, autoTimer = 0, saveTimer = 0, uiTimer = 0, achvTimer = 0;
+const MAX_ENTITIES = 70;            // performance guard for canvas sprites
+
+// Live entities (runtime only)
+const boats = [];                   // {x,y,state:'in'|'dock'|'out', crew, bob}
+const adepts = [];                  // {x,y,phase,speed,state:'walk'|'town'}
+const floaters = [];                // floating "+GDP" texts {x,y,text,life,color}
+let wavesPhase = 0;
+
+function spawnBoat(crewOverride){
+  if (boats.length >= 6) return;    // visual limit on simultaneous boats
+  const W = view.w, shoreY = view.shoreY;
+  boats.push({
+    x: W*(0.15+Math.random()*0.7), y: view.seaTop + 20 + Math.random()*40,
+    targetY: shoreY - 8,
+    state: "in", crew: crewOverride ?? crewSize(), bob: Math.random()*6.28,
+  });
+}
+function releaseBurst(){
+  // Tap burst: a few adepts hop out early with a small GDP bonus
+  const n = Math.min(6, Math.max(1, Math.floor(crewSize()/2)));
+  const cap = popCap();
+  const real = Math.min(n, Math.max(0, Math.floor(cap - S.pop)));
+  S.pop += real;
+  const bonus = gdpPerSec() * 1.5 + 1;   // small instant cash, keeps tapping relevant but not mandatory
+  S.gdp += bonus; S.totalGdpRun += bonus; S.totalGdpAll += bonus; S.daily.gdpEarned += bonus;
+  addFloater(view.w/2, view.shoreY - 20, "+" + fmt(bonus), "#ffd76a");
+  for (let i=0;i<real;i++) spawnAdept(view.w/2 + (Math.random()-0.5)*60, true);
+  vibrate(8); blip(660, .05);
+}
+function spawnAdept(x, running){
+  if (adepts.length >= MAX_ENTITIES) return;
+  adepts.push({ x, y: view.shoreY, phase: Math.random()*6.28,
+                speed: 26 + Math.random()*22, state: running?"walk":"walk" });
+}
+
+function tick(dt){
+  S.runTime += dt; S.playTime += dt;
+  // --- income ---
+  const inc = gdpPerSec()*dt;
+  S.gdp += inc; S.totalGdpRun += inc; S.totalGdpAll += inc; S.daily.gdpEarned += inc;
+  // --- reproduction: births plus a share of passive boat arrivals (Egg, Inc.-style) ---
+  const cap = popCap();
+  S.pop = Math.min(cap, S.pop + reproRate()*dt*(1 + BAL.BOAT_REPRO_SHARE));
+  S.stats.maxPop = Math.max(S.stats.maxPop, Math.floor(S.pop));
+  // --- energy ---
+  S.energy = Math.min(BAL.BOAT_ENERGY_MAX, S.energy + BAL.BOAT_ENERGY_REGEN*dt);
+  // --- passive boat arrivals ---
+  boatTimer += dt;
+  if (boatTimer >= boatInterval()){ boatTimer = 0; spawnBoat(); }
+  // --- auto-summon (Harbor Master) ---
+  if (S.up.autoSummon >= 1){
+    autoTimer += dt;
+    if (autoTimer >= 5){ autoTimer = 0;
+      if (S.energy >= BAL.BOAT_TAP_COST){ S.energy -= BAL.BOAT_TAP_COST; spawnBoat(); releaseBurst(); }
+    }
+  }
+  // --- auto-buy (Shopping Intern): cheapest affordable upgrade every ~2s ---
+  if (S.up.autoBuy >= 1){
+    buyTimer += dt;
+    if (buyTimer >= 2){ buyTimer = 0; autoBuyOnce(); }
+  }
+  // --- update boats ---
+  for (const b of boats){
+    b.bob += dt*3;
+    const sp = 60 * upStat("boatSpeed");
+    if (b.state === "in"){
+      b.y += sp*dt;
+      if (b.y >= b.targetY){
+        b.state = "dock"; b.dockT = 1.1;
+        // disembark: population gained, adepts animate toward town
+        const room = Math.max(0, Math.floor(cap - S.pop));
+        const landed = Math.min(b.crew, room);
+        S.pop += landed;
+        S.stats.boatsArrived++;
+        const shown = Math.min(landed, 8);
+        for (let i=0;i<shown;i++) spawnAdept(b.x + (Math.random()-0.5)*30);
+        if (landed>0) addFloater(b.x, b.y-14, "+"+fmt(landed)+" 👤", "#7ff5d0");
+      }
+    } else if (b.state === "dock"){
+      b.dockT -= dt;
+      if (b.dockT <= 0) b.state = "out";
+    } else { // leaving
+      b.y -= sp*1.4*dt;
+      if (b.y < view.seaTop - 30) b.dead = true;
+    }
+  }
+  for (let i=boats.length-1;i>=0;i--) if (boats[i].dead) boats.splice(i,1);
+  // --- update adepts (run inland, then wander in town) ---
+  for (const a of adepts){
+    a.phase += dt*10;
+    if (a.state === "walk"){
+      a.y -= a.speed*dt;
+      if (a.y <= view.townY){ a.state = "town"; a.tx = view.w*0.2 + Math.random()*view.w*0.6; a.ty = view.townY + Math.random()*view.bandH*0.5; }
+    } else {
+      // gentle wander inside town band
+      a.x += Math.cos(a.phase*0.3)*8*dt; a.y += Math.sin(a.phase*0.23)*6*dt;
+    }
+  }
+  for (let i=adepts.length-1;i>=0;i--){
+    const a = adepts[i];
+    if (a.state==="town" && adepts.filter(o=>o.state==="town").length > 26){ if (Math.random()<dt*0.3) adepts.splice(i,1); }
+  }
+  // --- floaters ---
+  for (const f of floaters){ f.y -= 26*dt; f.life -= dt; }
+  for (let i=floaters.length-1;i>=0;i--) if (floaters[i].life<=0) floaters.splice(i,1);
+  // --- periodic floater from income for feedback ---
+  incomeAccum += inc;
+  if (incomeAccum >= Math.max(1, gdpPerSec()*2)){
+    addFloater(view.w*0.5+(Math.random()-0.5)*80, view.townY+20, "+"+fmt(incomeAccum), "#ffd76a");
+    incomeAccum = 0;
+  }
+  // --- tier check ---
+  const ti = tierIndexFor(S.totalGdpRun);
+  if (ti !== S.tierIndex){ S.tierIndex = ti; if (ti>0){ toast("🎉 Your settlement grew into a " + TIERS[ti].name + "!"); blip(880,.12); confettiBurst(); } }
+  // --- achievements ---
+  achvTimer += dt;
+  if (achvTimer > 1){ achvTimer = 0; checkAchievements(); checkDaily(); }
+  // --- autosave ---
+  saveTimer += dt;
+  if (saveTimer >= BAL.SAVE_INTERVAL){ saveTimer = 0; save(); }
+  // --- UI refresh (throttled) ---
+  uiTimer += dt;
+  if (uiTimer >= 0.2){ uiTimer = 0; renderHUD(); if (currentTab) renderPanel(); }
+}
+let buyTimer = 0, incomeAccum = 0;
+S.tierIndex = 0;
+
+function autoBuyOnce(){
+  let best=null, bestCost=Infinity;
+  for (const u of UPGRADES){
+    if (u.maxLvl!==undefined && S.up[u.id]>=u.maxLvl) continue;
+    if (u.unlocked && !u.unlocked(S)) continue;
+    const c = upCost(u);
+    if (c<=S.gdp && c<bestCost){ best=u; bestCost=c; }
+  }
+  if (best) buyUpgrade(best.id);
+}
+function checkAchievements(){
+  for (const a of ACHIEVEMENTS){
+    if (!S.achv.includes(a.id) && a.test(S)){
+      S.achv.push(a.id);
+      toast("🏆 Achievement: " + a.name);
+    }
+  }
+}
+function checkDaily(){
+  const today = new Date().toISOString().slice(0,10);
+  if (S.daily.date !== today){ S.daily = { date:today, gdpEarned:0, done:false }; }
+  const goal = Math.max(1000, gdpPerSec()*3600*2);   // ~2 hours of production
+  if (!S.daily.done && S.daily.gdpEarned >= goal){
+    S.daily.done = true;
+    toast("✅ Daily goal complete! Bonus +"+fmt(goal*0.1)+" GDP");
+    S.gdp += goal*0.1; S.totalGdpRun += goal*0.1; S.totalGdpAll += goal*0.1;
+  }
+}
+
+/* =====================================================================
+   [JS-5] RENDERING — canvas scene + DOM HUD/panels
+   ===================================================================== */
+const cv = $("scene"), ctx = cv.getContext("2d");
+const view = { w:0, h:0, dpr:1, seaTop:0, shoreY:0, townY:0, bandH:0 };
+function resize(){
+  const r = cv.getBoundingClientRect();
+  view.dpr = Math.min(window.devicePixelRatio||1, 2);
+  view.w = r.width; view.h = r.height;
+  cv.width = Math.round(r.width*view.dpr); cv.height = Math.round(r.height*view.dpr);
+  ctx.setTransform(view.dpr,0,0,view.dpr,0,0);
+  // layout bands: sea bottom ~28%, shore line ~72% height, town upper-middle
+  view.seaTop = view.h*0.70;
+  view.shoreY = view.h*0.70;
+  view.townY  = view.h*0.24;
+  view.bandH  = view.h*0.20;
+}
+window.addEventListener("resize", resize);
+
+// deterministic pseudo-random for scenery
+function prand(seed){ const x = Math.sin(seed*127.1+311.7)*43758.5453; return x - Math.floor(x); }
+
+const PALETTES = {
+  straw:    { wall:"#d9b36a", roof:"#a8763e" },
+  wood:     { wall:"#b08050", roof:"#6d4c2f" },
+  brick:    { wall:"#c96f5a", roof:"#7a3b30" },
+  concrete: { wall:"#9aa5ad", roof:"#5c666e" },
+  glass:    { wall:"#7fd4e8", roof:"#3a7d8c" },
+  tower:    { wall:"#e8e6df", roof:"#4a6fa5" },
+};
+function drawScene(t){
+  const {w,h} = view;
+  wavesPhase += 0.016;
+  const sky = ctx.createLinearGradient(0,0,0,view.seaTop);
+  sky.addColorStop(0,"#7fd0e8"); sky.addColorStop(1,"#cdeffb");
+  ctx.fillStyle = sky; ctx.fillRect(0,0,w,view.seaTop);
+  // sun
+  ctx.fillStyle = "rgba(255,235,130,.9)"; ctx.beginPath(); ctx.arc(w*0.82, h*0.10, 26, 0, 7); ctx.fill();
+  // clouds
+  ctx.fillStyle = "rgba(255,255,255,.8)";
+  for (let i=0;i<3;i++){
+    const cx = ((t*0.008*(i+1) + i*w/3) % (w+120)) - 60, cy = h*(0.06+i*0.05);
+    ctx.beginPath(); ctx.ellipse(cx,cy,34,12,0,0,7); ctx.ellipse(cx+24,cy+4,22,9,0,0,7); ctx.fill();
+  }
+  // grass island band
+  const land = ctx.createLinearGradient(0,view.townY-40,0,view.seaTop);
+  land.addColorStop(0,"#6fbf5a"); land.addColorStop(1,"#e8d59a");
+  ctx.fillStyle = land;
+  ctx.beginPath();
+  ctx.moveTo(0, view.seaTop);
+  ctx.lineTo(0, view.h*0.30);
+  ctx.quadraticCurveTo(w*0.5, view.h*0.16, w, view.h*0.30);
+  ctx.lineTo(w, view.seaTop);
+  ctx.closePath(); ctx.fill();
+  // path from shore to town
+  ctx.strokeStyle = "rgba(190,160,110,.8)"; ctx.lineWidth = Math.max(14, w*0.06);
+  ctx.lineCap = "round";
+  ctx.beginPath(); ctx.moveTo(w*0.5, view.shoreY-4);
+  ctx.quadraticCurveTo(w*0.42, (view.shoreY+view.townY)/2, w*0.5, view.townY+10);
+  ctx.stroke();
+
+  // town buildings (count & style grow with tier)
+  const tier = TIERS[S.tierIndex];
+  const n = tier.buildings;
+  for (let i=0;i<n;i++){
+    const seed = i*7.3;
+    const px = w*0.12 + (i/n)*w*0.76 + prand(seed)*10;
+    const py = view.townY + prand(seed+1)*view.bandH*0.55;
+    const pal = PALETTES[tier.palette[i % tier.palette.length]];
+    const bw = 26 + prand(seed+2)*16 + S.tierIndex*3;
+    const bh = 26 + prand(seed+3)*20 + S.tierIndex*8;
+    ctx.fillStyle = pal.wall; ctx.fillRect(px-bw/2, py-bh, bw, bh);
+    ctx.fillStyle = pal.roof;
+    if (S.tierIndex>=3){ ctx.fillRect(px-bw/2-3, py-bh-5, bw+6, 6); }
+    else { ctx.beginPath(); ctx.moveTo(px-bw/2-4, py-bh); ctx.lineTo(px, py-bh-14); ctx.lineTo(px+bw/2+4, py-bh); ctx.closePath(); ctx.fill(); }
+    ctx.fillStyle = "rgba(40,30,20,.55)";
+    ctx.fillRect(px-4, py-bh*0.55, 6, 6); ctx.fillRect(px+3, py-bh*0.3, 6, 6);
+  }
+  // palm trees near shore
+  for (let i=0;i<4;i++){
+    const px = w*(0.1+0.26*i)+prand(i*3)*20, py = view.shoreY - 18 - prand(i*5)*14;
+    ctx.strokeStyle="#8a6a3a"; ctx.lineWidth=4;
+    ctx.beginPath(); ctx.moveTo(px,py+18); ctx.quadraticCurveTo(px+6,py,px+2,py-14); ctx.stroke();
+    ctx.fillStyle="#3f9d4e";
+    for (let k=0;k<5;k++){ const ang = -2.6 + k*0.6;
+      ctx.beginPath(); ctx.ellipse(px+2+Math.cos(ang)*12, py-14+Math.sin(ang)*8, 12, 4, ang, 0, 7); ctx.fill(); }
+  }
+
+  // sea with animated wave line
+  const sea = ctx.createLinearGradient(0,view.seaTop,0,h);
+  sea.addColorStop(0,"#2ea3c9"); sea.addColorStop(1,"#0b5f86");
+  ctx.fillStyle = sea; ctx.fillRect(0,view.seaTop,w,h-view.seaTop);
+  ctx.strokeStyle = "rgba(255,255,255,.55)"; ctx.lineWidth = 3;
+  ctx.beginPath();
+  for (let x=0;x<=w;x+=8){
+    const y = view.seaTop + Math.sin(x*0.03 + wavesPhase*3)*3;
+    x===0 ? ctx.moveTo(x,y) : ctx.lineTo(x,y);
+  }
+  ctx.stroke();
+  // foam at shore
+  ctx.fillStyle = "rgba(255,255,255,.35)";
+  ctx.beginPath();
+  for (let x=0;x<=w;x+=10){
+    ctx.rect(x, view.seaTop + Math.sin(x*0.05+wavesPhase*2)*2, 6, 4);
+  }
+  ctx.fill();
+
+  // boats (inflatable: rounded hull + sail + adept dots)
+  for (const b of boats){
+    const bobY = Math.sin(b.bob)*2;
+    const yy = b.y + bobY;
+    ctx.save(); ctx.translate(b.x, yy);
+    ctx.fillStyle = "#ff8f4d";
+    ctx.beginPath(); ctx.ellipse(0, 4, 20, 7, 0, 0, 7); ctx.fill();     // tube
+    ctx.fillStyle = "#e56b2a";
+    ctx.beginPath(); ctx.ellipse(0, 4, 20, 7, 0, 0, Math.PI); ctx.fill(); // lower tube shade
+    ctx.strokeStyle = "#fdf6e3"; ctx.lineWidth = 2;
+    ctx.beginPath(); ctx.moveTo(0,-2); ctx.lineTo(0,-18); ctx.stroke();   // mast
+    ctx.fillStyle = "#fff8e8";
+    ctx.beginPath(); ctx.moveTo(1,-18); ctx.lineTo(13,-4); ctx.lineTo(1,-4); ctx.closePath(); ctx.fill(); // sail
+    const dots = Math.min(5, Math.ceil(b.crew/2));
+    ctx.fillStyle = "#2b2b2b";
+    for (let i=0;i<dots;i++){ ctx.beginPath(); ctx.arc(-10+i*5, -1, 2.2, 0, 7); ctx.fill(); }
+    ctx.restore();
+  }
+
+  // adepts (stick-figure runners)
+  ctx.lineWidth = 2;
+  for (const a of adepts){
+    const legSwing = Math.sin(a.phase)*4;
+    ctx.strokeStyle = "#333"; ctx.fillStyle = "#ffd9a0";
+    ctx.beginPath(); ctx.arc(a.x, a.y-10, 3.2, 0, 7); ctx.fill();      // head
+    ctx.beginPath();
+    ctx.moveTo(a.x, a.y-7); ctx.lineTo(a.x, a.y-1);                       // body
+    ctx.moveTo(a.x, a.y-1); ctx.lineTo(a.x-3+legSwing*0.5, a.y+5);        // legs
+    ctx.moveTo(a.x, a.y-1); ctx.lineTo(a.x+3-legSwing*0.5, a.y+5);
+    ctx.stroke();
+  }
+
+  // floating texts
+  ctx.textAlign = "center"; ctx.font = "700 15px system-ui";
+  for (const f of floaters){
+    ctx.globalAlpha = clamp(f.life,0,1);
+    ctx.fillStyle = f.color;
+    ctx.fillText(f.text, f.x, f.y);
+    ctx.globalAlpha = 1;
+  }
+  // confetti particles
+  for (const p of confetti){
+    p.x += p.vx*0.016; p.y += p.vy*0.016; p.vy += 20*0.016; p.life -= 0.016;
+    ctx.globalAlpha = clamp(p.life,0,1); ctx.fillStyle = p.c;
+    ctx.fillRect(p.x,p.y,4,4); ctx.globalAlpha = 1;
+  }
+  for (let i=confetti.length-1;i>=0;i--) if (confetti[i].life<=0) confetti.splice(i,1);
+}
+function addFloater(x,y,text,color){
+  if (floaters.length > 14) floaters.shift();
+  floaters.push({x,y,text,color,life:1.6});
+}
+const confetti = [];
+function confettiBurst(){
+  for (let i=0;i<40;i++)
+    confetti.push({ x:view.w/2+(Math.random()-0.5)*100, y:view.h*0.3,
+      vx:(Math.random()-0.5)*220, vy:-Math.random()*180-40, life:1.2+Math.random(),
+      c:["#ffd76a","#ff8f4d","#7ff5d0","#c99aff","#8ef06a"][i%5] });
+}
+
+// ---- DOM HUD ----
+function renderHUD(){
+  $("gdpVal").textContent = fmt(S.gdp);
+  $("gpsVal").textContent = fmt(gdpPerSec());
+  $("popVal").textContent = fmt(Math.floor(S.pop));
+  $("capVal").textContent = fmt(popCap());
+  $("tierVal").textContent = TIERS[S.tierIndex].name;
+  const next = TIERS[S.tierIndex+1];
+  $("nextTierVal").textContent = next ? ("Next: " + next.name + " (" + fmt(next.gdp) + " GDP)") : "Max tier reached!";
+  const ePct = S.energy/BAL.BOAT_ENERGY_MAX*100;
+  $("energyFill").style.width = ePct + "%";
+  $("energyFill").style.background = ePct>=100 ? "linear-gradient(90deg,#ffe97a,#ffd76a)" : "linear-gradient(90deg,#38e8c8,#8ef06a)";
+  const chip = $("legacyChip");
+  if (S.founders>0 || S.prestiges>0){
+    chip.hidden = false;
+    chip.textContent = "✦ " + fmt(S.founders) + " Founders · ×" + (1+0.1*S.founders).toFixed(2);
+  }
+}
+
+// ---- Panels ----
+let currentTab = null;
+function openTab(tab){
+  if (currentTab === tab){ closePanel(); return; }
+  currentTab = tab;
+  document.querySelectorAll("#navbar button").forEach(b=>b.classList.toggle("active", b.dataset.tab===tab));
+  $("panel").classList.add("open");
+  $("panelTitle").textContent = {upgrades:"🛠️ Upgrades", research:"🔬 Research", prestige:"✦ Founders", settings:"⚙️ Settings"}[tab];
+  renderPanel();
+}
+function closePanel(){
+  currentTab = null;
+  $("panel").classList.remove("open");
+  document.querySelectorAll("#navbar button").forEach(b=>b.classList.remove("active"));
+}
+let buyMode = 1; // 1 | 10 | max
+function renderPanel(){
+  const body = $("panelBody");
+  if (currentTab==="upgrades") body.innerHTML = panelUpgrades();
+  else if (currentTab==="research") body.innerHTML = panelResearch();
+  else if (currentTab==="prestige") body.innerHTML = panelPrestige();
+  else if (currentTab==="settings") body.innerHTML = panelSettings();
+}
+function panelUpgrades(){
+  let html = `<div id="buyModeRow">` +
+    [1,10,"MAX"].map(m=>`<button class="${buyMode===m?'active':''}" onclick="buyMode=${typeof m==='number'?m:'\"max\"'};renderPanel();">${m===1?"x1":m===10?"x10":"MAX"}</button>`).join("") + `</div>`;
+  const groups = [...new Set(UPGRADES.map(u=>u.group))];
+  for (const g of groups){
+    html += `<div class="group-label">${g}</div>`;
+    for (const u of UPGRADES.filter(x=>x.group===g)){
+      const locked = u.unlocked && !u.unlocked(S);
+      const lvl = S.up[u.id];
+      const maxed = u.maxLvl!==undefined && lvl>=u.maxLvl;
+      if (locked){
+        html += `<button class="row-btn locked" disabled>
+          <span class="r-ico">🔒</span><span class="r-main"><span class="r-name">${u.name}</span>
+          <span class="r-desc">Keep playing to unlock…</span></span></button>`;
+        continue;
+      }
+      const cost = bulkCost(u, buyMode);
+      const afford = !maxed && S.gdp >= cost;
+      html += `<button class="row-btn ${afford?'affordable':''}" ${maxed?'disabled':''} onclick="buyUpgrade('${u.id}')">
+        <span class="r-ico">${u.icon}</span>
+        <span class="r-main">
+          <span class="r-name">${u.name}</span>
+          <span class="r-desc">${u.desc}</span>
+          <span class="r-eff">Lv ${lvl}${maxed?" · MAX":""}</span>
+        </span>
+        <span class="r-cost"><span class="r-price">${maxed?"—":"🪙"+fmt(cost)}</span></span>
+      </button>`;
+    }
+  }
+  return html;
+}
+function bulkCost(u, mode){
+  let n = mode==="max" ? 0 : mode;
+  if (mode==="max"){
+    // how many levels can we afford? iterate with geometric series cap
+    let budget = S.gdp, cost = upCost(u), cnt = 0;
+    const cm = Math.max(1.0001, costMultFor(u));
+    while (cnt < 1000 && budget >= cost && (u.maxLvl===undefined || S.up[u.id]+cnt < u.maxLvl)){
+      budget -= cost; cnt++;
+      cost = Math.ceil(u.baseCost*discount(u.group)*Math.pow(cm, S.up[u.id]+cnt));
+    }
+    n = Math.max(1, cnt);
+  }
+  let total = 0;
+  for (let i=0;i<n;i++){
+    const lvl = S.up[u.id]+i;
+    if (u.maxLvl!==undefined && lvl>=u.maxLvl) break;
+    total += Math.ceil(u.baseCost*discount(u.group)*Math.pow(costMultFor(u), lvl));
+  }
+  return total;
+}
+function panelResearch(){
+  let html = `<div class="info-box">Research is powerful but <b>resets on Prestige</b>. Spend wisely.</div>`;
+  for (const r of RESEARCH){
+    const owned = S.research.includes(r.id);
+    const afford = !owned && S.gdp >= r.cost;
+    html += `<button class="row-btn ${owned?'bought':afford?'affordable':''}" ${owned?'disabled':''} onclick="buyResearch('${r.id}')">
+      <span class="r-ico">${r.icon}</span>
+      <span class="r-main"><span class="r-name">${r.name}</span><span class="r-desc">${r.desc}</span></span>
+      <span class="r-cost"><span class="r-price">${owned?"✔ DONE":"🪙"+fmt(r.cost)}</span></span>
+    </button>`;
+  }
+  return html;
+}
+function panelPrestige(){
+  const gain = prestigeGain();
+  const need = BAL.PRESTIGE_REQ;
+  const prog = clamp(S.totalGdpRun/need,0,1);
+  let html = `
+  <div class="info-box">
+    <div class="kv"><span>Founders held</span><b>✦ ${fmt(S.founders)}</b></div>
+    <div class="kv"><span>Current global bonus</span><b>×${(1+0.1*S.founders).toFixed(2)} GDP</b></div>
+    <div class="kv"><span>Total GDP this run</span><b>${fmt(S.totalGdpRun)}</b></div>
+    <div class="kv"><span>Prestiges</span><b>${S.prestiges}</b></div>
+  </div>
+  <div class="info-box">
+    <b>Each Founder permanently gives:</b><br>
+    +10% GDP · +1% boat arrivals · +2% housing &amp; crew<br><br>
+    <b>Reset:</b> GDP, adepts, upgrades, research.<br>
+    <b>Kept:</b> Founders, achievements, settings.
+  </div>`;
+  if (gain>0){
+    html += `<button class="big-btn prestige" onclick="doPrestige(true)">✦ PRESTIGE — become a Founder (+${gain})</button>`;
+  } else {
+    html += `<div class="group-label">Progress to first Founder</div>
+      <div class="info-box">Reach ${fmt(need)} total GDP this run.<br>
+      Progress: ${fmt(S.totalGdpRun)} / ${fmt(need)}
+      <div class="bar"><div style="width:${prog*100}%"></div></div></div>
+      <button class="big-btn prestige" disabled>Not yet — earn ${fmt(need)} GDP</button>`;
+  }
+  html += `<div class="group-label">Achievements (${S.achv.length}/${ACHIEVEMENTS.length})</div>`;
+  for (const a of ACHIEVEMENTS){
+    html += `<div class="achv ${S.achv.includes(a.id)?'done':''}"><span class="a-ico">${a.icon}</span><span>${a.name}</span>${S.achv.includes(a.id)?" ✔":""}</div>`;
+  }
+  return html;
+}
+function panelSettings(){
+  const today = new Date().toISOString().slice(0,10);
+  const goal = Math.max(1000, gdpPerSec()*3600*2);
+  return `
+  <div class="group-label">Daily goal — ${today}</div>
+  <div class="info-box goal-line ${S.daily.done?'done':''}">
+    Earn ${fmt(goal)} GDP today ${S.daily.done?"✔ COMPLETE":""}<br>
+    Progress: ${fmt(S.daily.gdpEarned)}
+    <div class="bar"><div style="width:${clamp(S.daily.gdpEarned/goal,0,1)*100}%"></div></div>
+  </div>
+  <div class="group-label">Options</div>
+  <button class="row-btn" onclick="toggleSound()"><span class="r-ico">${S.settings.sound?"🔊":"🔇"}</span>
+    <span class="r-main"><span class="r-name">Sound &amp; haptics</span></span>
+    <span class="r-cost"><span class="r-price">${S.settings.sound?"ON":"OFF"}</span></span></button>
+  <div class="info-box" style="font-size:12px">
+    Game auto-saves every ${BAL.SAVE_INTERVAL}s and when you leave the page.<br>
+    Offline earnings are capped at ${BAL.OFFLINE_CAP_HOURS} hours.
+  </div>
+  <button class="big-btn danger" onclick="hardReset()">🗑️ Hard reset (delete all progress)</button>`;
+}
+
+/* =====================================================================
+   [JS-6] ACTIONS, INPUT, AUDIO, BOOT
+   ===================================================================== */
+function buyUpgrade(id){
+  const u = UPGRADES.find(x=>x.id===id);
+  if (!u) return;
+  let times = (buyMode===1)?1:undefined;
+  // buy one level per click unless MAX/x10 handled via bulkCost preview:
+  const cost = upCost(u);
+  if (u.maxLvl!==undefined && S.up[u.id]>=u.maxLvl) return;
+  if (S.gdp < cost){ toast("Not enough GDP (" + fmt(cost) + " needed)"); return; }
+  if (buyMode==="max" || buyMode===10){
+    const n = buyMode==="max" ? (()=>{ let cnt=0,budget=S.gdp,c=upCost(u);
+      while(cnt<1000&&budget>=c&&(u.maxLvl===undefined||S.up[u.id]+cnt<u.maxLvl)){budget-=c;cnt++;c=Math.ceil(u.baseCost*discount(u.group)*Math.pow(costMultFor(u),S.up[u.id]+cnt));}
+      return Math.max(1,cnt);})() : 10;
+    const total = bulkCost(u, n);
+    if (S.gdp < total){ /* buy as many as affordable */ }
+    let bought=0, spent=0;
+    for (let i=0;i<n;i++){
+      const c = upCost(u);
+      if (u.maxLvl!==undefined && S.up[u.id]>=u.maxLvl) break;
+      if (S.gdp < c) break;
+      S.gdp -= c; S.up[u.id]++; bought++; spent+=c;
+    }
+    if (bought){ blip(520+bought*10,.05); vibrate(5); }
+  } else {
+    S.gdp -= cost; S.up[u.id]++;
+    blip(520,.05); vibrate(5);
+  }
+  renderHUD(); renderPanel();
+}
+function buyResearch(id){
+  const r = RESEARCH.find(x=>x.id===id);
+  if (!r || S.research.includes(id)) return;
+  if (S.gdp < r.cost){ toast("Not enough GDP"); return; }
+  S.gdp -= r.cost; S.research.push(id);
+  toast("🔬 Researched: " + r.name); blip(740,.1); save(); renderPanel();
+}
+function doPrestige(confirmed){
+  const gain = prestigeGain();
+  if (gain<=0) return;
+  if (!confirmed){ return; }
+  if (!confirm(`Become a Founder?\n\nYou will gain ✦ ${gain} Founder(s) (permanent +${(gain*10)}% GDP).\nYour GDP, adepts, upgrades and research will reset.`)) return;
+  const keep = {
+    founders: S.founders + gain,
+    prestiges: S.prestiges + 1,
+    achv: S.achv,
+    settings: S.settings,
+    totalGdpAll: S.totalGdpAll,
+    totalClicks: S.totalClicks,
+  };
+  S = defaultState();
+  Object.assign(S, keep);
+  S.tierIndex = 0;
+  boats.length = 0; adepts.length = 0; floaters.length = 0;
+  toast("✦ You are now a Founder! The tide carries your legacy.");
+  confettiBurst(); blip(990,.2); vibrate([20,40,20]);
+  save(); renderHUD(); renderPanel();
+}
+function toggleSound(){ S.settings.sound = !S.settings.sound; save(); renderPanel(); }
+function hardReset(){
+  if (!confirm("Really delete ALL progress? This cannot be undone.")) return;
+  try{ localStorage.removeItem(BAL.SAVE_KEY); }catch(e){}
+  S = defaultState(); S.tierIndex = 0;
+  boats.length=0; adepts.length=0; floaters.length=0;
+  save(); renderHUD(); renderPanel(); toast("Fresh tide. Good luck!");
+}
+
+// Tiny WebAudio blips (no external assets)
+let AC = null;
+function blip(freq, dur){
+  if (!S.settings.sound) return;
+  try{
+    AC = AC || new (window.AudioContext||window.webkitAudioContext)();
+    if (AC.state==="suspended") AC.resume();
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type="triangle"; o.frequency.value=freq;
+    g.gain.setValueAtTime(0.08, AC.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.001, AC.currentTime+dur);
+    o.connect(g); g.connect(AC.destination);
+    o.start(); o.stop(AC.currentTime+dur);
+  }catch(e){}
+}
+
+// Tap handling: tapping the sea/shore summons a boat + burst (energy cost)
+cv.addEventListener("pointerdown", (ev)=>{
+  const rect = cv.getBoundingClientRect();
+  const y = ev.clientY - rect.top;
+  if (y > view.seaTop - 30){            // tap zone: shore & sea (generous hit area)
+    if (S.energy >= BAL.BOAT_TAP_COST){
+      S.energy -= BAL.BOAT_TAP_COST;
+      S.totalClicks++;
+      spawnBoat();
+      releaseBurst();
+      blip(440,.06);
+    } else {
+      addFloater(ev.clientX-rect.left, y-10, "…tired tides", "#ffffff");
+    }
+  }
+});
+document.querySelectorAll("#navbar button").forEach(b=>b.addEventListener("click",()=>openTab(b.dataset.tab)));
+// Tap outside the open sheet (on the visible canvas area) closes it — mobile UX nicety.
+cv.addEventListener("click", ()=>{ if (currentTab) closePanel(); });
+$("panelClose").addEventListener("click", closePanel);
+$("legacyChip").addEventListener("click", ()=>openTab("prestige"));
+window.addEventListener("beforeunload", save);
+document.addEventListener("visibilitychange", ()=>{ if (document.hidden) save(); });
+
+// ---- Main loop (fixed-ish dt, clamped for tab switches) ----
+let last = performance.now();
+function frame(now){
+  const dt = clamp((now-last)/1000, 0, 0.25);
+  last = now;
+  tick(dt);
+  drawScene(now/1000);
+  requestAnimationFrame(frame);
+}
+
+// ---- Boot ----
+(function boot(){
+  const loaded = load();
+  resize();
+  S.tierIndex = tierIndexFor(S.totalGdpRun);
+  if (loaded) applyOffline();
+  else {
+    // First launch intro
+    toast("🌊 Adepts are drifting toward your shore. Tap the sea!");
+  }
+  renderHUD();
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
